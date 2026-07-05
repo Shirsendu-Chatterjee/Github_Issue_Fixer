@@ -1,112 +1,331 @@
-# github-issue-fixer
+# GitHub Issue Fixer
 
-![Project: Python](https://img.shields.io/badge/python-%3E%3D3.11-blue)
-![Project: Research/Prototype](https://img.shields.io/badge/status-prototype-orange)
+## Table of Contents
 
-Table of contents
-- Project summary
-- Implementation overview
-- Component breakdown
-- Data flow & algorithms
-- Key libraries and rationale
-- Limitations & tests
-- Future roadmap & integration ideas
-- Contact
+* Project Summary
+* Architecture
+* Features
+* Processing Pipeline
+* Component Breakdown
+* Retrieval & Code Understanding
+* Technology Stack
+* Current Limitations
+* Future Roadmap
+* Contact
 
-Project summary
-----------------
-github-issue-fixer is a Python prototype that automates technical issue triage and initial remediation suggestions for GitHub repositories by combining retrieval-augmented generation (RAG) with lightweight programmatic orchestration. The tool scans a repository, builds a vector index of repository content, and runs a state-machine pipeline that classifies open issues, retrieves context (repo + wiki), invokes an LLM to produce targeted specialist output, and formats the result for posting back to GitHub.
+---
 
-This repository contains two primary scripts used during development: `new.py` (primary implementation) and `main.py` (alternate/older flow). The implementation targets modern transformer embeddings and FAISS for fast similarity search, and uses a small state-graph orchestrator to structure the reasoning workflow.
+# Project Summary
 
-Implementation overview
------------------------
-- Purpose: enable automated, context-aware issue analysis by combining local repository signals (file contents, README, code) with external knowledge (Wikipedia) and an LLM-driven reasoning pipeline.
-- Design goals: modular nodes for discrete responsibilities (classification, retrieval, specialist reasoning, synthesis, and commenting), reproducible prompt patterns, and a retrieval layer to ground LLM output in repository context.
-- Execution model: synchronous Python runtime that builds an in-memory FAISS index at startup and then iterates over open GitHub issues, invoking the compiled `StateGraph` for each issue.
+**GitHub Issue Fixer** is an AI-powered GitHub issue triage and analysis system that combines **code-aware Retrieval-Augmented Generation (RAG)**, **Abstract Syntax Tree (AST) analysis**, and **agentic retrieval planning** to automatically understand repository codebases and generate technical responses for GitHub issues.
 
-Component breakdown
--------------------
-- `new.py` (primary)
-  - Repo ingestion: `_fetch_repo_files(max_files)` walks repository contents via PyGithub and collects text from common file types.
-  - Chunking/embedding: `_chunk()` splits large files and `SentenceTransformer` (`all-MiniLM-L6-v2`) encodes chunks into embeddings.
-  - Indexing: `build_faiss_index()` constructs a `faiss.IndexFlatL2` index and stores encoded chunks for RAG lookup.
-  - Retrieval helpers: `rag_search(query, k)` performs nearest-neighbour search over the FAISS index; `wiki_search()` fetches succinct summaries from Wikipedia as an auxiliary context.
-  - State nodes (LangGraph):
-    - `classifier_node`: prompts an LLM to categorize an issue and extract a short wiki keyword.
-    - `rag_node`: collects repository-grounded context for the issue.
-    - `wiki_node`: retrieves external background knowledge.
-    - `specialist_node`: issues a role-specific prompt (bug/feature/docs/security) to the LLM to produce remediation or recommendations.
-    - `synthesizer_node`: formats the LLM output into clean markdown.
-    - `commenter_node`: posts the synthesized result back to GitHub via PyGithub.
-  - Runtime: `run()` enumerates open issues and runs the compiled StateGraph for each.
+Unlike traditional document RAG systems that simply split files into fixed-size chunks, this project performs **structure-aware code parsing**, generates semantic summaries for code chunks using an LLM, retrieves repository-specific context through vector search, and iteratively plans additional retrieval steps before generating a final response.
 
-- `main.py` (auxiliary)
-  - Contains an earlier state-machine variant with simpler branching between `doc_solver` and `bug_fixer` nodes and demonstrates a straightforward prompt/response loop.
+The entire workflow is orchestrated using **LangGraph**, allowing every stage of reasoning to be represented as a modular state machine.
 
-Data flow & algorithms
-----------------------
-- Repository ingestion → chunking → embedding → FAISS index construction
-  - Chunking uses fixed-size windows (CHUNK_SIZE=400) to limit each vector payload.
-  - Embeddings: `SentenceTransformer(all-MiniLM-L6-v2)` produces dense vectors optimized for semantic similarity at small scale.
-  - Index: `faiss.IndexFlatL2` is used for approximate nearest neighbour search (flat L2 index; fast and suitable for moderate-scale indexes).
-- Issue processing pipeline
-  - Input: GitHub issue (title, body, labels).
-  - Classification: LLM assigns an issue type (bug/documentation/feature/security/unknown) and suggests a short wiki query.
-  - Retrieval: RAG search on local repo chunks and Wikipedia summary provide grounding/context.
-  - Specialist reasoning: LLM uses structured system prompts tuned per issue type to produce root cause, debugging steps, or implementation guidance.
-  - Synthesis: LLM is asked to produce clean markdown for human consumption; optionally posted back to GitHub.
+---
 
-Key libraries and rationale
---------------------------
-- PyGithub (`pygithub`): programmatic access to repository files, issues, labels, and issue comments.
-- SentenceTransformers: compact sentence embeddings for semantic retrieval; offers strong performance with small footprint.
-- FAISS (`faiss-cpu`): highly optimized vector index for nearest-neighbour search; `IndexFlatL2` chosen for simplicity and deterministic nearest-neighbour results.
-- LangChain-Groq / ChatGroq: LLM invocation wrapper used to call a Groq-backed large model with temperature control and prompt lifecycle.
-- LangGraph: lightweight state-graph orchestrator to express the processing pipeline as nodes and edges; aids in modularity and testing.
-- Wikipedia: quick external knowledge summaries to augment repository context when issues require domain background.
+# Architecture
 
-Limitations & tests
--------------------
-- Hard-coded credentials and API keys appear in `new.py`/`main.py`. This is unsafe; any production usage must replace inline secrets with secure environment management (e.g., secrets manager, environment variables, or GitHub Actions secrets).
-- The current indexing is in-memory and synchronous; building the FAISS index at startup loads entire embeddings into RAM and blocks the process until complete. For larger repositories, use on-disk vector stores or incremental indexing.
-- Error handling is minimal — many network calls (GitHub, Wikipedia, LLM API) are wrapped with broad excepts that swallow failures. Tests should assert behaviour on API failures and rate-limits.
-- No automated tests are present. Recommended minimal tests:
-  - Unit tests for chunking and embedding pipeline (deterministic chunk sizes, handling of binary files).
-  - Integration test that runs a mock `StateGraph` against a small local repo snapshot and asserts node outputs for a representative issue.
-  - Mocked API tests for GitHub and LLM interactions (use VCR or responses for HTTP mocking).
+```
+GitHub Repository
+        │
+        ▼
+Repository Crawling
+        │
+        ▼
+AST-based Code Chunking
+        │
+        ▼
+LLM Code Summarization
+        │
+        ▼
+Code-aware Embeddings
+(st-codesearch-distilroberta-base)
+        │
+        ▼
+FAISS Vector Index
+        │
+        ▼
+GitHub Issue
+        │
+        ▼
+Issue Classification
+        │
+        ▼
+Agentic Retrieval Loop
+(Retrieve → Evaluate → Retrieve Again)
+        │
+        ▼
+Optional Wikipedia Retrieval
+        │
+        ▼
+Specialist LLM
+(Bug / Feature / Documentation / Security)
+        │
+        ▼
+Markdown Synthesis
+        │
+        ▼
+Automatic GitHub Comment
+```
 
-Future roadmap & integration ideas (technical)
---------------------------------------------
-1. Robust secret management and CI integration
-   - Remove inline secrets; support env-based configuration and a clear `.env.example` for development.
-   - Add GitHub Actions workflows for linting, unit tests, and static analysis.
+---
 
-2. Modularize and package the core pipeline
-   - Factor ingestion, retrieval, LLM orchestration, and GitHub I/O into separate modules with explicit interfaces.
-   - Publish as a lightweight package with entrypoints for programmatic usage and integration into CI pipelines.
+# Features
 
-3. Scalable retrieval
-   - Move from in-memory `IndexFlatL2` to a persistent, sharded vector store (e.g., FAISS on-disk, Milvus, Weaviate) with incremental updates.
-   - Add chunk metadata (file path, line ranges) and passage scoring to produce actionable citations in LLM output.
+* AST-based semantic chunking for Python source code
+* Function-aware and class-aware repository indexing
+* JavaScript/TypeScript structural chunking
+* Automatic LLM-generated summaries for every code chunk
+* Code-search-optimized embedding model
+* FAISS semantic retrieval
+* Multi-hop agentic retrieval planning
+* Intelligent Wikipedia usage only when external knowledge is beneficial
+* Issue classification into:
 
-4. Deterministic prompts and evaluation
-   - Formalize prompt templates and add automated evaluation harnesses (BLEU/ROUGE-like where applicable, or human-in-the-loop scoring) to validate that suggested fixes are accurate and actionable.
-   - Add shadow runs for pull requests and measure false-positive/false-negative triage rates.
+  * Bug
+  * Feature
+  * Documentation
+  * Security
+  * Unknown
+* Specialist prompts tailored to each issue category
+* Automatic Markdown formatting
+* Automatic GitHub issue commenting
+* LangGraph orchestration for modular execution
 
-5. Resilience and monitoring
-   - Switch to async I/O (async GitHub client, async LLM calls) to improve throughput.
-   - Instrument with telemetry: request latencies, LLM token consumption, success/failure rates, number of issues processed.
+---
 
-6. Multi-model fallback and cost control
-   - Add a multi-LLM strategy: cheap model for classification, higher-quality model for synthesis, and a deterministic fallback for critical security findings.
-   - Add token budgeting and throttling to control costs.
+# Processing Pipeline
 
-7. Integration surfaces
-   - GitHub App / Bot: run as an app to react to issue events (open/label change) instead of polling.
-   - CI Hooks: run the triage pipeline in pull requests to auto-generate diagnostics or documentation suggestions.
-   - Slack/MS Teams / Email notifications: configurable sinks for triage summaries.
+## 1. Repository Ingestion
 
-Contact
--------
-For technical questions about architecture or to request specific resume-friendly summaries, inspect `new.py` for implementation details or open an issue in this repository.
+The repository is traversed using **PyGithub**.
+
+Supported file types include:
+
+* Python
+* JavaScript
+* TypeScript
+* Markdown
+* JSON
+* YAML
+* HTML
+* CSS
+* Shell
+* Text
+* Jupyter notebooks
+
+Large binary files are ignored to reduce unnecessary processing.
+
+---
+
+## 2. Structure-Aware Code Chunking
+
+Instead of splitting code into arbitrary fixed-size windows, the project parses source code structurally.
+
+### Python
+
+Python files are parsed using the built-in **AST module**.
+
+Chunks are created for:
+
+* top-level functions
+* class methods
+* class bodies
+* module-level code
+
+This preserves logical program boundaries and avoids splitting functions across multiple chunks.
+
+### JavaScript / TypeScript
+
+A lightweight parser identifies:
+
+* functions
+* arrow functions
+* classes
+
+using regular-expression boundary detection.
+
+### Other Files
+
+Non-code files fall back to fixed-size chunking.
+
+---
+
+## 3. LLM Code Summaries
+
+Every code chunk is summarized into a concise natural-language description.
+
+Example:
+
+```
+Summary:
+Authenticates users using OAuth2 and returns an access token.
+```
+
+These summaries improve retrieval by allowing natural-language GitHub issues to match implementation semantics rather than only code tokens.
+
+---
+
+## 4. Code Embeddings
+
+Repository chunks are embedded using:
+
+**st-codesearch-distilroberta-base**
+
+This model is trained specifically for mapping natural-language descriptions to source code, making it significantly better suited for code retrieval than general-purpose sentence embedding models.
+
+---
+
+## 5. Semantic Retrieval
+
+Embeddings are indexed using **FAISS IndexFlatL2**.
+
+When a GitHub issue is processed, semantic similarity search retrieves the most relevant repository context before reasoning begins.
+
+---
+
+## 6. Agentic Retrieval Planning
+
+Rather than retrieving repository context only once, the system performs an iterative retrieval loop.
+
+The LLM evaluates whether sufficient repository evidence has been gathered.
+
+If additional context is needed, it generates a refined search query and performs another retrieval cycle.
+
+This process continues until:
+
+* enough evidence has been collected, or
+* the configured retrieval limit is reached.
+
+---
+
+## 7. Intelligent Wikipedia Retrieval
+
+External knowledge is not always required.
+
+A planning node first determines whether background information from Wikipedia would improve the final response.
+
+Examples include:
+
+* protocols
+* algorithms
+* standards
+* security concepts
+
+If unnecessary, this step is skipped entirely.
+
+---
+
+## 8. Specialist Reasoning
+
+Different issue categories invoke different reasoning templates.
+
+Supported specialists include:
+
+* Bug Analysis
+* Documentation Review
+* Feature Planning
+* Security Assessment
+
+Each specialist receives:
+
+* GitHub issue content
+* retrieved repository context
+* optional Wikipedia context
+
+before generating a technical response.
+
+---
+
+## 9. Markdown Synthesis
+
+The generated response is cleaned and formatted into readable Markdown suitable for GitHub discussions.
+
+---
+
+## 10. Automatic GitHub Commenting
+
+The final response is automatically posted to the corresponding GitHub issue using the GitHub API.
+
+---
+
+# Component Breakdown
+
+| Component          | Responsibility                                         |
+| ------------------ | ------------------------------------------------------ |
+| Repository Fetcher | Downloads repository files                             |
+| AST Chunker        | Generates semantic code chunks                         |
+| Summary Generator  | Produces natural-language summaries                    |
+| Embedding Model    | Converts code into dense vectors                       |
+| FAISS              | Performs semantic nearest-neighbor retrieval           |
+| Retrieval Planner  | Determines whether more repository context is required |
+| Wiki Planner       | Decides if external knowledge is useful                |
+| Specialist         | Produces issue-specific technical recommendations      |
+| Synthesizer        | Formats clean Markdown                                 |
+| Commenter          | Posts results back to GitHub                           |
+
+---
+
+# Retrieval & Code Understanding
+
+This project improves code understanding through multiple complementary techniques:
+
+* AST-aware semantic chunking
+* Code-search-specific embeddings
+* Natural-language code summaries
+* Repository-aware retrieval
+* Agentic multi-hop search
+* Optional external knowledge grounding
+
+Together these components enable more accurate retrieval than traditional fixed-window document chunking.
+
+---
+
+# Technology Stack
+
+* Python
+* LangGraph
+* LangChain
+* ChatGroq
+* PyGithub
+* SentenceTransformers
+* FAISS
+* NumPy
+* Wikipedia API
+* Python AST
+
+---
+
+# Current Limitations
+
+* FAISS index is built entirely in memory.
+* Repository summaries are regenerated each startup rather than cached.
+* Retrieval currently relies on dense vector similarity without reranking.
+* Cross-file call graphs are not yet incorporated.
+* Repository maps are not yet generated.
+* Index updates are not incremental.
+
+---
+
+# Future Roadmap
+
+* Persistent vector databases (Qdrant or LanceDB)
+* Hybrid retrieval (Dense + BM25)
+* Cross-encoder reranking
+* AST-derived call graph construction
+* Repository map generation
+* Cached code summaries
+* Incremental repository indexing
+* GitHub App deployment
+* CI/CD integration
+* Multi-model routing
+* Repository knowledge graph
+* Automated evaluation benchmarks
+
+---
+
+# Contact
+
+Contributions, suggestions, and issue reports are welcome. Feel free to open an issue or submit a pull request to help improve the project.
