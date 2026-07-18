@@ -1,4 +1,4 @@
-import os, re, ast
+import os, re, ast, sys, json
 from typing import TypedDict, Literal
 from langchain_groq import ChatGroq
 import github as gh_lib
@@ -9,9 +9,9 @@ from langgraph.graph import StateGraph, START, END
 
 os.environ["GROQ_API_KEY"] = ""
 GITHUB_TOKEN = ""
-REPO_NAME    = "Shirsendu-Chatterjee/ei"
+REPO_NAME    = ""
 
-llm = ChatGroq(model="qwen/qwen3-32b", temperature=0.2)
+llm = ChatGroq(model="qwen/qwen3.6-27b", temperature=0.2)
 
 auth = gh_lib.Auth.Token(GITHUB_TOKEN)
 g    = gh_lib.Github(auth=auth)
@@ -28,7 +28,8 @@ CHUNK_SIZE          = 400   # fallback char-chunk size for non-code files
 MAX_CHUNK_CHARS     = 1200  # any single function/class chunk larger than this gets sub-split
 MAX_RETRIEVAL_HOPS  = 3     # cap on agentic retrieve->replan loops
 
-_rag_chunks: list[str] = []
+_rag_chunks: list[str] = []   # embedded/stored text, aligned index-for-index with _rag_labels
+_rag_labels: list[str] = []   # e.g. "app.py | class Foo.method_a" — for showing what was retrieved
 
 
 # --------------------------------------------------------------------------
@@ -167,44 +168,35 @@ def _split_by_extension(path: str, text: str) -> list[tuple[str, str]]:
 
 
 # --------------------------------------------------------------------------
-# LLM-generated summaries for each chunk. The summary is prepended to the
-# stored/embedded text so a natural-language issue query ("users can't log
-# in with Google SSO") matches semantically, not just on code tokens.
+# No LLM call here on purpose — summarizing every chunk before embedding
+# burns one LLM call per function/class in the repo (token cost scales with
+# repo size). Store raw code, tagged with its file + function/class label,
+# and let the code-search-tuned encoder handle semantic matching directly.
 # --------------------------------------------------------------------------
 
-def _summarize_chunk(label: str, code: str) -> str:
-    prompt = f"""
-        Summarize in ONE short, specific sentence what this code does.
-        No preamble, no filler — just the sentence.
-
-        {label}:
-        {code[:1000]}
-    """
-    try:
-        return llm.invoke(prompt).content.strip().splitlines()[0]
-    except Exception:
-        return ""
-
-
-def _chunk_file(path: str, text: str) -> list[str]:
-    final: list[str] = []
+def _chunk_file(path: str, text: str) -> list[tuple[str, str]]:
+    """Returns (label, embedded_text) pairs — label is used later to show
+    which function/class/block was actually retrieved."""
+    final: list[tuple[str, str]] = []
     for label, code in _split_by_extension(path, text):
         code = code.strip()
         if not code:
             continue
         pieces = [code] if len(code) <= MAX_CHUNK_CHARS else [c for _, c in _chunk_fixed(code, MAX_CHUNK_CHARS)]
         for piece in pieces:
-            summary = _summarize_chunk(label, piece)
-            header = f"[FILE: {path} | {label}]"
-            body = f"Summary: {summary}\n\n{piece}" if summary else piece
-            final.append(f"{header}\n{body}")
+            tag = f"{path} | {label}"
+            final.append((tag, f"[FILE: {tag}]\n{piece}"))
     return final
 
 
 def build_faiss_index() -> faiss.IndexFlatL2:
-    global _rag_chunks
+    """Fetches the repo, chunks every file, and embeds everything from
+    scratch. Only called on a cache miss — see load_or_build_index."""
+    global _rag_chunks, _rag_labels
     for path, raw in _fetch_repo_files():
-        _rag_chunks.extend(_chunk_file(path, raw))
+        for label, text in _chunk_file(path, raw):
+            _rag_labels.append(label)
+            _rag_chunks.append(text)
 
     dim = EMBED_MODEL.get_sentence_embedding_dimension()
     index = faiss.IndexFlatL2(dim)
@@ -214,7 +206,46 @@ def build_faiss_index() -> faiss.IndexFlatL2:
     return index
 
 
-FAISS_INDEX = build_faiss_index()
+# --------------------------------------------------------------------------
+# Persistence: one folder per repo under ./database, e.g.
+#   database/Shirsendu-Chatterjee__ei/index.faiss   (the vectors)
+#   database/Shirsendu-Chatterjee__ei/chunks.json    (text + labels, index-aligned)
+# On startup we check for this folder first — only fetch/chunk/embed the
+# repo (the expensive path) if no cache exists yet.
+# --------------------------------------------------------------------------
+
+DB_ROOT = "database"
+
+
+def _repo_db_dir(repo_name: str) -> str:
+    return os.path.join(DB_ROOT, repo_name.replace("/", "__"))
+
+
+def load_or_build_index(repo_name: str) -> faiss.IndexFlatL2:
+    global _rag_chunks, _rag_labels
+    db_dir     = _repo_db_dir(repo_name)
+    index_path = os.path.join(db_dir, "index.faiss")
+    meta_path  = os.path.join(db_dir, "chunks.json")
+
+    if os.path.exists(index_path) and os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        _rag_chunks = meta["chunks"]
+        _rag_labels = meta["labels"]
+        print(f"[rag] loaded {len(_rag_chunks)} cached chunks from {db_dir}")
+        return faiss.read_index(index_path)
+
+    print(f"[rag] no cache for {repo_name!r} — indexing repo from scratch")
+    index = build_faiss_index()
+    os.makedirs(db_dir, exist_ok=True)
+    faiss.write_index(index, index_path)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump({"chunks": _rag_chunks, "labels": _rag_labels}, f)
+    print(f"[rag] cached {len(_rag_chunks)} chunks to {db_dir}")
+    return index
+
+
+FAISS_INDEX = load_or_build_index(REPO_NAME)
 
 
 def rag_search(query: str, k: int = 5) -> str:
@@ -222,7 +253,14 @@ def rag_search(query: str, k: int = 5) -> str:
         return ""
     q_vec = np.array(EMBED_MODEL.encode([query], show_progress_bar=False), dtype="float32")
     _, indices = FAISS_INDEX.search(q_vec, k)
-    return "\n---\n".join(_rag_chunks[i] for i in indices[0] if 0 <= i < len(_rag_chunks))
+    valid = [i for i in indices[0] if 0 <= i < len(_rag_chunks)]
+
+    if valid:
+        print(f"[retrieve] query={query!r}")
+        for i in valid:
+            print(f"    -> {_rag_labels[i]}")
+
+    return "\n---\n".join(_rag_chunks[i] for i in valid)
 
 
 def wiki_search(query: str, sentences: int = 5) -> str:
@@ -441,28 +479,35 @@ builder.add_edge("commenter",         END)
 app = builder.compile()
 
 
-def run():
-    for issue in repo.get_issues(state="open"):
-        state: IssueState = {
-            "issue_number"  : issue.number,
-            "title"         : issue.title,
-            "body"          : issue.body or "",
-            "raw_labels"    : list(issue.labels),
-            "issue_type"    : "unknown",
-            "rag_context"   : "",
-            "queries_tried" : [],
-            "retrieval_hops": 0,
-            "next_query"    : "",
-            "wiki_needed"   : False,
-            "wiki_query"    : "",
-            "wiki_context"  : "",
-            "action_needed" : "",
-            "posted"        : False,
-        }
-        result = app.invoke(state)
-        print(result["action_needed"])
-        print("Posted:", result["posted"], "| retrieval hops:", result["retrieval_hops"], "| wiki used:", result["wiki_needed"])
+def run(issue_number: int):
+    """Processes exactly one issue — deliberately not a loop over all open
+    issues, since each run can involve several LLM calls (classification,
+    multiple retrieval hops, wiki planning, specialist reasoning, synthesis)
+    and looping over every open issue would multiply token usage fast."""
+    issue = repo.get_issue(issue_number)
+    state: IssueState = {
+        "issue_number"  : issue.number,
+        "title"         : issue.title,
+        "body"          : issue.body or "",
+        "raw_labels"    : list(issue.labels),
+        "issue_type"    : "unknown",
+        "rag_context"   : "",
+        "queries_tried" : [],
+        "retrieval_hops": 0,
+        "next_query"    : "",
+        "wiki_needed"   : False,
+        "wiki_query"    : "",
+        "wiki_context"  : "",
+        "action_needed" : "",
+        "posted"        : False,
+    }
+    result = app.invoke(state)
+    print(result["action_needed"])
+    print("Posted:", result["posted"], "| retrieval hops:", result["retrieval_hops"], "| wiki used:", result["wiki_needed"])
+    return result
 
 
 if __name__ == "__main__":
-    run()
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: python issue_fixer.py <issue_number>")
+    run(int(sys.argv[1]))
